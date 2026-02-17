@@ -1,14 +1,14 @@
-import os
-
-import logfire
-import aio_pika
-import json
 import datetime
-import anyio
-import anyio.to_thread as to_thread
+import json
+import os
 from functools import partial
 from pathlib import Path
-from typing import Any, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import aio_pika
+import anyio
+import anyio.to_thread as to_thread
+import logfire
 from k.config import Config
 from k.agent.memory.folder import FolderMemoryStore
 from k.starters.telegram.runner import (
@@ -86,7 +86,7 @@ async def run_amqp_forever(
     queue_name: str,
     keyword: str,
     chat_ids: set[int] | None,
-    updates_store_path: Optional[Path] = None,
+    updates_store_path: Path | None = None,
     dispatch_recent_per_chat: int = 0,
     tz: datetime.tzinfo,
 ):
@@ -255,7 +255,23 @@ async def run_amqp_forever(
                             )
                         
                         if grouped:
-                            dispatch_groups = grouped
+                            # If chat_ids is provided, treat it as an exclusive filter for dispatching
+                            # to avoid duplicate processing in multi-instance setups.
+                            if chat_ids is not None:
+                                dispatch_groups = {
+                                    cid: updates
+                                    for cid, updates in grouped.items()
+                                    if cid in chat_ids
+                                }
+                            else:
+                                dispatch_groups = grouped
+
+                            if not dispatch_groups:
+                                # Trigger condition matched but no updates from watched chats to dispatch.
+                                # Clear pending to avoid re-evaluating the same batch.
+                                pending_updates_by_id.clear()
+                                continue
+
                             dispatch_source = "pending"
                             replaced_groups = 0
                             if updates_store_path is not None and dispatch_recent_per_chat > 0:
@@ -356,17 +372,24 @@ async def run(
     keyword: str,
     model: Any,
     chat_id: str = "",
-    updates_store_path: Optional[Path] = None,
+    updates_store_path: str | Path | None = None,
     dispatch_recent_per_chat: int = 0,
     timezone: str = _DEFAULT_TIMEZONE,
 ) -> None:
+    """Entrypoint for the Telegram AMQP starter.
+
+    Notes:
+    - `updates_store_path` accepts either a `Path` or a string path and is
+      normalized to a `Path` before being passed to lower-level helpers.
+    """
     if amqp_url is None:
         amqp_url = os.environ.get("AMQP_URL")
     if amqp_url is None:
-        raise ValueError("amqp_url is required (pass it directly or set AMQP_URL env var)")
+        raise ValueError(
+            "amqp_url is required (pass it directly or set AMQP_URL env var)"
+        )
     logfire.configure()
     logfire.instrument_pydantic_ai()
-
 
     config = Config()
     try:
@@ -387,6 +410,15 @@ async def run(
             raise ValueError(f"Invalid chat_id entry in: {raw_chat_ids!r}") from e
         parsed_chat_ids = _expand_chat_id_watchlist(parsed_chat_ids)
 
+    store_path: Path | None
+    raw_store_path = (
+        "" if updates_store_path is None else str(updates_store_path).strip()
+    )
+    if raw_store_path:
+        store_path = Path(raw_store_path).expanduser()
+    else:
+        store_path = None
+
     await run_amqp_forever(
         config=config,
         model=model,
@@ -395,7 +427,7 @@ async def run(
         queue_name=queue_name,
         keyword=keyword,
         chat_ids=parsed_chat_ids,
-        updates_store_path=updates_store_path,
+        updates_store_path=store_path,
         dispatch_recent_per_chat=dispatch_recent_per_chat,
         tz=tz,
     )
